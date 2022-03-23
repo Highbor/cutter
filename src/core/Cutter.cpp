@@ -408,7 +408,7 @@ bool CutterCore::isDebugTaskInProgress()
     return false;
 }
 
-bool CutterCore::asyncCmdEsil(const char *command, QSharedPointer<RizinCmdTask> &task)
+bool CutterCore::asyncCmdEsil(const char *command, QSharedPointer<RizinTask> &task)
 {
     asyncCmd(command, task);
 
@@ -417,7 +417,7 @@ bool CutterCore::asyncCmdEsil(const char *command, QSharedPointer<RizinCmdTask> 
     }
 
     connect(task.data(), &RizinCmdTask::finished, task.data(), [this, task]() {
-        QString res = task.data()->getResult();
+        QString res = ((RizinCmdTask *)task.data())->getResult();
 
         if (res.contains(QStringLiteral("[ESIL] Stopped execution in an invalid instruction"))) {
             msgBox.showMessage("Stopped when attempted to run an invalid instruction. You can "
@@ -428,7 +428,7 @@ bool CutterCore::asyncCmdEsil(const char *command, QSharedPointer<RizinCmdTask> 
     return true;
 }
 
-bool CutterCore::asyncCmd(const char *str, QSharedPointer<RizinCmdTask> &task)
+bool CutterCore::asyncCmd(const char *str, QSharedPointer<RizinTask> &task)
 {
     if (!task.isNull()) {
         return false;
@@ -438,8 +438,8 @@ bool CutterCore::asyncCmd(const char *str, QSharedPointer<RizinCmdTask> &task)
 
     RVA offset = core->offset;
 
-    task = QSharedPointer<RizinCmdTask>(new RizinCmdTask(str, true));
-    connect(task.data(), &RizinCmdTask::finished, task.data(), [this, offset, task]() {
+    task = QSharedPointer<RizinTask>(new RizinCmdTask(str, true));
+    connect(task.data(), &RizinTask::finished, task.data(), [this, offset, task]() {
         CORE_LOCK();
 
         if (offset != core->offset) {
@@ -450,8 +450,7 @@ bool CutterCore::asyncCmd(const char *str, QSharedPointer<RizinCmdTask> &task)
     return true;
 }
 
-bool CutterCore::asyncTask(std::function<void(RzCore *)> fcn,
-                           QSharedPointer<RizinFunctionTask> &task)
+bool CutterCore::asyncTask(std::function<void(RzCore *)> fcn, QSharedPointer<RizinTask> &task)
 {
     if (!task.isNull()) {
         return false;
@@ -459,13 +458,13 @@ bool CutterCore::asyncTask(std::function<void(RzCore *)> fcn,
 
     CORE_LOCK();
     RVA offset = core->offset;
-    task = QSharedPointer<RizinFunctionTask>(new RizinFunctionTask(
+    task = QSharedPointer<RizinTask>(new RizinFunctionTask(
             [&](RzCore *core) {
                 fcn(core);
                 return (void *)NULL;
             },
             true));
-    connect(task.data(), &RizinFunctionTask::finished, task.data(), [this, offset, task]() {
+    connect(task.data(), &RizinTask::finished, task.data(), [this, offset, task]() {
         CORE_LOCK();
 
         if (offset != core->offset) {
@@ -1830,11 +1829,8 @@ void CutterCore::setRegister(QString regName, QString regValue)
 
 void CutterCore::setCurrentDebugThread(int tid)
 {
-    if (!asyncTask(
-                [=](RzCore *core) {
-                    rz_debug_select(core->dbg, core->dbg->pid, tid);
-                },
-                debugFunctionTask)) {
+    if (!asyncTask([=](RzCore *core) { rz_debug_select(core->dbg, core->dbg->pid, tid); },
+                   debugTask)) {
         return;
     }
 
@@ -1860,7 +1856,7 @@ void CutterCore::setCurrentDebugProcess(int pid)
                     rz_debug_select(core->dbg, pid, core->dbg->tid);
                     core->dbg->main_pid = pid;
                 },
-                debugFunctionTask)) {
+                debugTask)) {
         return;
     }
 
@@ -2133,7 +2129,7 @@ void CutterCore::continueDebug()
             return;
         }
     } else {
-        if (!asyncTask([](RzCore *core) { rz_core_debug_continue(core); }, debugFunctionTask)) {
+        if (!asyncTask([](RzCore *core) { rz_debug_continue(core->dbg); }, debugTask)) {
             return;
         }
     }
@@ -2160,7 +2156,7 @@ void CutterCore::continueBackDebug()
             return;
         }
     } else {
-        if (!asyncTask([](RzCore *core) { rz_debug_continue_back(core->dbg); }, debugFunctionTask)) {
+        if (!asyncTask([](RzCore *core) { rz_debug_continue_back(core->dbg); }, debugTask)) {
             return;
         }
     }
@@ -2176,14 +2172,14 @@ void CutterCore::continueBackDebug()
     debugTask->startTask();
 }
 
-void CutterCore::continueUntilDebug(QString offset)
+void CutterCore::continueUntilDebug(ut64 offset)
 {
     if (!currentlyDebugging) {
         return;
     }
 
     if (currentlyEmulating) {
-        if (!asyncCmdEsil("aecu " + offset, debugTask)) {
+        if (!asyncCmdEsil("aecu " + QString::number(offset), debugTask)) {
             return;
         }
     } else {
@@ -2192,7 +2188,6 @@ void CutterCore::continueUntilDebug(QString offset)
             return;
         }
     }
-
     emit debugTaskStateChanged();
     connect(debugTask.data(), &RizinTask::finished, this, [this]() {
         debugTask.clear();
@@ -2200,7 +2195,6 @@ void CutterCore::continueUntilDebug(QString offset)
         emit refreshCodeViews();
         emit debugTaskStateChanged();
     });
-
     debugTask->startTask();
 }
 
@@ -2215,7 +2209,7 @@ void CutterCore::continueUntilCall()
             return;
         }
     } else {
-        if (!asyncTask([](RzCore *core) { rz_core_debug_single_step_over(core); }, debugTask)) {
+        if (!asyncTask([](RzCore *core) { rz_core_debug_step_one(core, 0); }, debugTask)) {
             return;
         }
     }
@@ -2395,7 +2389,7 @@ void CutterCore::startTraceSession()
     } else {
         if (!asyncTask(
                     [](RzCore *core) {
-                        core->dbg->session = z_debug_session_new();
+                        core->dbg->session = rz_debug_session_new();
                         rz_debug_add_checkpoint(core->dbg);
                     },
                     debugTask)) {
